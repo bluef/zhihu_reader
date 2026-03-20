@@ -6,8 +6,9 @@ Capabilities:
 - question page
 - answer page
 - article page
-- keyword search mode (helper for finding candidate Zhihu URLs)
-- optional requests session cookie support
+- keyword search helper
+- optional cookie support via ZHIHU_COOKIE
+- optional request headers support via ZHIHU_HEADERS_JSON
 - Zhihu questions answers API extraction when available
 - fallback to HTML/debug saving when content extraction fails
 - fallback to requests when Playwright browser is unavailable
@@ -75,6 +76,33 @@ def parse_cookie_string(cookie_string: str):
     return cookies
 
 
+def parse_json_env(name: str):
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def build_headers(extra=None, referer='https://www.zhihu.com/'):
+    headers = {
+        'User-Agent': DEFAULT_UA,
+        'Referer': referer,
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    }
+    if extra and isinstance(extra, dict):
+        for k, v in extra.items():
+            if v is None:
+                continue
+            headers[str(k)] = str(v)
+    return headers
+
+
 def extract_text_from_html(html: str, selectors):
     for selector in selectors:
         if selector.replace('.', '') in html:
@@ -95,7 +123,7 @@ async def collect_answers(page):
     return answers
 
 
-async def read_with_playwright(url: str):
+async def read_with_playwright(url: str, extra_headers=None):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         context = await browser.new_context(
@@ -103,6 +131,7 @@ async def read_with_playwright(url: str):
             user_agent=DEFAULT_UA,
             locale='zh-CN',
             timezone_id='Asia/Shanghai',
+            extra_http_headers=build_headers(extra_headers, referer=url),
         )
         page = await context.new_page()
         try:
@@ -115,10 +144,9 @@ async def read_with_playwright(url: str):
             await browser.close()
 
 
-async def read_with_requests(url: str, cookies=None):
-    headers = {'User-Agent': DEFAULT_UA, 'Referer': 'https://www.zhihu.com/'}
+async def read_with_requests(url: str, cookies=None, extra_headers=None):
     session = requests.Session()
-    session.headers.update(headers)
+    session.headers.update(build_headers(extra_headers, referer=url))
     if cookies:
         session.cookies.update(cookies)
     r = session.get(url, timeout=20)
@@ -130,12 +158,12 @@ def extract_question_id(url: str):
     return m.group(1) if m else None
 
 
-def fetch_question_answers_api(url: str, cookies=None, limit=20):
+def fetch_question_answers_api(url: str, cookies=None, extra_headers=None, limit=20):
     qid = extract_question_id(url)
     if not qid:
         return None
     session = requests.Session()
-    session.headers.update({'User-Agent': DEFAULT_UA, 'Referer': url})
+    session.headers.update(build_headers(extra_headers, referer=url))
     if cookies:
         session.cookies.update(cookies)
     api = f'https://www.zhihu.com/api/v4/questions/{qid}/answers'
@@ -170,8 +198,7 @@ def fetch_question_answers_api(url: str, cookies=None, limit=20):
     return results
 
 
-def search_candidates(keyword: str, limit: int = 10):
-    # Zhihu search pages are often blocked; use a direct site: URL as a helper output only.
+def search_candidates(keyword: str):
     q = quote(f'site:zhihu.com {keyword}')
     return {
         'keyword': keyword,
@@ -189,16 +216,17 @@ async def read_page(url: str):
     cookie_string = os.getenv('ZHIHU_COOKIE', '').strip()
     if cookie_string:
         cookies = parse_cookie_string(cookie_string)
+    extra_headers = parse_json_env('ZHIHU_HEADERS_JSON')
 
     try:
-        title, html, _ = await read_with_playwright(url)
+        title, html, _ = await read_with_playwright(url, extra_headers=extra_headers)
     except Exception as e:
         playwright_ok = False
         title = f'Playwright unavailable: {e.__class__.__name__}'
 
     if not html:
         try:
-            title, html, _ = await read_with_requests(url, cookies=cookies)
+            title, html, _ = await read_with_requests(url, cookies=cookies, extra_headers=extra_headers)
         except Exception as e:
             return {'url': url, 'type': page_type, 'error': str(e)}
 
@@ -213,7 +241,7 @@ async def read_page(url: str):
             'html_preview': html[:5000],
         }
 
-        api_answers = fetch_question_answers_api(url, cookies=cookies, limit=20)
+        api_answers = fetch_question_answers_api(url, cookies=cookies, extra_headers=extra_headers, limit=20)
         if isinstance(api_answers, list):
             result['answers_count'] = len(api_answers)
             result['answers'] = api_answers
@@ -229,6 +257,7 @@ async def read_page(url: str):
                         user_agent=DEFAULT_UA,
                         locale='zh-CN',
                         timezone_id='Asia/Shanghai',
+                        extra_http_headers=build_headers(extra_headers, referer=url),
                     )
                     page = await context.new_page()
                     await page.goto(url, wait_until='domcontentloaded', timeout=45000)
@@ -278,17 +307,12 @@ async def main():
     parser.add_argument('--search', action='store_true', help='Treat target as a keyword and return candidate Zhihu search info')
     args = parser.parse_args()
 
-    if args.search:
+    if args.search or not (args.target.startswith('http://') or args.target.startswith('https://')):
         print(json.dumps(search_candidates(args.target), ensure_ascii=False, indent=2))
         return
 
-    if args.target.startswith('http://') or args.target.startswith('https://'):
-        result = await read_page(args.target)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-
-    # fallback: treat non-url input as keyword search helper
-    print(json.dumps(search_candidates(args.target), ensure_ascii=False, indent=2))
+    result = await read_page(args.target)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

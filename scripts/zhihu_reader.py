@@ -6,24 +6,23 @@ Capabilities:
 - question page
 - answer page
 - article page
+- keyword search mode (helper for finding candidate Zhihu URLs)
 - optional requests session cookie support
 - Zhihu questions answers API extraction when available
 - fallback to HTML/debug saving when content extraction fails
 - fallback to requests when Playwright browser is unavailable
 """
+import argparse
 import asyncio
 import html as htmlmod
 import json
 import os
 import re
 import sys
-from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from playwright.async_api import async_playwright
-
-OUT_DIR = Path('/root/.openclaw/workspace/skills/zhihu-page-reader/out')
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_UA = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -171,6 +170,16 @@ def fetch_question_answers_api(url: str, cookies=None, limit=20):
     return results
 
 
+def search_candidates(keyword: str, limit: int = 10):
+    # Zhihu search pages are often blocked; use a direct site: URL as a helper output only.
+    q = quote(f'site:zhihu.com {keyword}')
+    return {
+        'keyword': keyword,
+        'hint_url': f'https://www.zhihu.com/search?type=content&q={q}',
+        'note': 'Zhihu search may require login or be blocked. If search is inaccessible, provide a question URL or title.'
+    }
+
+
 async def read_page(url: str):
     page_type = classify_url(url)
     title = ''
@@ -264,12 +273,22 @@ async def read_page(url: str):
 
 
 async def main():
-    if len(sys.argv) < 2:
-        print('Usage: zhihu_reader.py <url>')
-        sys.exit(1)
-    url = sys.argv[1]
-    result = await read_page(url)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('target', help='Zhihu URL or search keyword')
+    parser.add_argument('--search', action='store_true', help='Treat target as a keyword and return candidate Zhihu search info')
+    args = parser.parse_args()
+
+    if args.search:
+        print(json.dumps(search_candidates(args.target), ensure_ascii=False, indent=2))
+        return
+
+    if args.target.startswith('http://') or args.target.startswith('https://'):
+        result = await read_page(args.target)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    # fallback: treat non-url input as keyword search helper
+    print(json.dumps(search_candidates(args.target), ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':
